@@ -11,12 +11,12 @@ import { spawn } from 'node:child_process';
 import { downloadRipGrep } from '@joshua.litt/get-ripgrep';
 import type { ToolInvocation, ToolResult } from './tools.js';
 import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
-import { SchemaValidator } from '../utils/schemaValidator.js';
 import { makeRelative, shortenPath } from '../utils/paths.js';
-import { getErrorMessage, isNodeError } from '../utils/errors.js';
+import { getErrorMessage } from '../utils/errors.js';
 import type { Config } from '../config/config.js';
 import { fileExists } from '../utils/fileUtils.js';
 import { Storage } from '../config/storage.js';
+import { resolveToolPath } from '../utils/pathResolution.js';
 
 const DEFAULT_TOTAL_MAX_MATCHES = 20000;
 
@@ -86,61 +86,37 @@ class GrepToolInvocation extends BaseToolInvocation<
     super(params);
   }
 
-  /**
-   * Checks if a path is within the root directory and resolves it.
-   * @param relativePath Path relative to the root directory (or undefined for root).
-   * @returns The absolute path if valid and exists, or null if no path specified (to search all directories).
-   * @throws {Error} If path is outside root, doesn't exist, or isn't a directory.
-   */
-  private resolveAndValidatePath(relativePath?: string): string | null {
-    // If no path specified, return null to indicate searching all workspace directories
-    if (!relativePath) {
-      return null;
-    }
-
-    const targetPath = path.resolve(this.config.getTargetDir(), relativePath);
-
-    // Security Check: Ensure the resolved path is within workspace boundaries
-    const workspaceContext = this.config.getWorkspaceContext();
-    if (!workspaceContext.isPathWithinWorkspace(targetPath)) {
-      const directories = workspaceContext.getDirectories();
-      throw new Error(
-        `Path validation failed: Attempted path "${relativePath}" resolves outside the allowed workspace directories: ${directories.join(', ')}`,
-      );
-    }
-
-    // Check existence and type after resolving
-    try {
-      const stats = fs.statSync(targetPath);
-      if (!stats.isDirectory()) {
-        throw new Error(`Path is not a directory: ${targetPath}`);
-      }
-    } catch (error: unknown) {
-      if (isNodeError(error) && error.code !== 'ENOENT') {
-        throw new Error(`Path does not exist: ${targetPath}`);
-      }
-      throw new Error(
-        `Failed to access path stats for ${targetPath}: ${error}`,
-      );
-    }
-
-    return targetPath;
-  }
-
   async execute(signal: AbortSignal): Promise<ToolResult> {
     try {
       const workspaceContext = this.config.getWorkspaceContext();
-      const searchDirAbs = this.resolveAndValidatePath(this.params.path);
       const searchDirDisplay = this.params.path || '.';
 
-      // Determine which directories to search
-      let searchDirectories: readonly string[];
-      if (searchDirAbs === null) {
-        // No path specified - search all workspace directories
-        searchDirectories = workspaceContext.getDirectories();
+      // Determine which paths to search
+      let searchPaths: readonly string[];
+
+      if (this.params.path) {
+        // 1. Resolve the path asynchronously
+        const resolution = await resolveToolPath({
+          inputPath: this.params.path,
+          config: this.config,
+          expectedType: 'either',
+          allowNonExistent: false,
+        });
+
+        if (!resolution.success) {
+          return {
+            llmContent: resolution.error,
+            returnDisplay: `Error: ${resolution.error}`,
+            error: {
+              message: resolution.error,
+              type: resolution.errorType,
+            },
+          };
+        }
+        searchPaths = [resolution.absolutePath];
       } else {
-        // Specific path provided - search only that directory
-        searchDirectories = [searchDirAbs];
+        // No path specified - search all workspace directories
+        searchPaths = workspaceContext.getDirectories();
       }
 
       let allMatches: GrepMatch[] = [];
@@ -150,20 +126,20 @@ class GrepToolInvocation extends BaseToolInvocation<
         console.log(`[GrepTool] Total result limit: ${totalMaxMatches}`);
       }
 
-      for (const searchDir of searchDirectories) {
+      const targetDir = this.config.getTargetDir();
+
+      for (const searchPath of searchPaths) {
         const searchResult = await this.performRipgrepSearch({
           pattern: this.params.pattern,
-          path: searchDir,
+          path: searchPath,
           include: this.params.include,
           signal,
         });
 
-        if (searchDirectories.length > 1) {
-          const dirName = path.basename(searchDir);
-          searchResult.forEach((match) => {
-            match.filePath = path.join(dirName, match.filePath);
-          });
-        }
+        // Make paths relative to targetDir
+        searchResult.forEach((match) => {
+          match.filePath = path.relative(targetDir, match.filePath);
+        });
 
         allMatches = allMatches.concat(searchResult);
 
@@ -174,7 +150,7 @@ class GrepToolInvocation extends BaseToolInvocation<
       }
 
       let searchLocationDescription: string;
-      if (searchDirAbs === null) {
+      if (!this.params.path) {
         const numDirs = workspaceContext.getDirectories().length;
         searchLocationDescription =
           numDirs > 1
@@ -243,7 +219,7 @@ class GrepToolInvocation extends BaseToolInvocation<
     }
   }
 
-  private parseRipgrepOutput(output: string, basePath: string): GrepMatch[] {
+  private parseRipgrepOutput(output: string): GrepMatch[] {
     const results: GrepMatch[] = [];
     if (!output) return results;
 
@@ -258,7 +234,8 @@ class GrepToolInvocation extends BaseToolInvocation<
       const secondColonIndex = line.indexOf(':', firstColonIndex + 1);
       if (secondColonIndex === -1) continue;
 
-      const filePathRaw = line.substring(0, firstColonIndex);
+      // ripgrep with --with-filename returns absolute paths
+      const absoluteFilePath = line.substring(0, firstColonIndex);
       const lineNumberStr = line.substring(
         firstColonIndex + 1,
         secondColonIndex,
@@ -268,11 +245,8 @@ class GrepToolInvocation extends BaseToolInvocation<
       const lineNumber = parseInt(lineNumberStr, 10);
 
       if (!isNaN(lineNumber)) {
-        const absoluteFilePath = path.resolve(basePath, filePathRaw);
-        const relativeFilePath = path.relative(basePath, absoluteFilePath);
-
         results.push({
-          filePath: relativeFilePath || path.basename(absoluteFilePath),
+          filePath: absoluteFilePath,
           lineNumber,
           line: lineContent,
         });
@@ -289,32 +263,37 @@ class GrepToolInvocation extends BaseToolInvocation<
   }): Promise<GrepMatch[]> {
     const { pattern, path: absolutePath, include } = options;
 
+    const isFile = fs.statSync(absolutePath).isFile();
+
     const rgArgs = [
       '--line-number',
       '--no-heading',
-      '--with-filename',
+      '--with-filename', // Ensures absolute paths in output
       '--ignore-case',
       '--regexp',
       pattern,
     ];
 
-    if (include) {
-      rgArgs.push('--glob', include);
-    }
+    // Only use include/exclude if searching a directory
+    if (!isFile) {
+      if (include) {
+        rgArgs.push('--glob', include);
+      }
 
-    const excludes = [
-      '.git',
-      'node_modules',
-      'bower_components',
-      '*.log',
-      '*.tmp',
-      'build',
-      'dist',
-      'coverage',
-    ];
-    excludes.forEach((exclude) => {
-      rgArgs.push('--glob', `!${exclude}`);
-    });
+      const excludes = [
+        '.git',
+        'node_modules',
+        'bower_components',
+        '*.log',
+        '*.tmp',
+        'build',
+        'dist',
+        'coverage',
+      ];
+      excludes.forEach((exclude) => {
+        rgArgs.push('--glob', `!${exclude}`);
+      });
+    }
 
     rgArgs.push('--threads', '4');
     rgArgs.push(absolutePath);
@@ -366,7 +345,7 @@ class GrepToolInvocation extends BaseToolInvocation<
         });
       });
 
-      return this.parseRipgrepOutput(output, absolutePath);
+      return this.parseRipgrepOutput(output);
     } catch (error: unknown) {
       console.error(`GrepLogic: ripgrep failed: ${getErrorMessage(error)}`);
       throw error;
@@ -384,21 +363,15 @@ class GrepToolInvocation extends BaseToolInvocation<
       description += ` in ${this.params.include}`;
     }
     if (this.params.path) {
-      const resolvedPath = path.resolve(
-        this.config.getTargetDir(),
-        this.params.path,
-      );
-      if (
-        resolvedPath === this.config.getTargetDir() ||
-        this.params.path === '.'
-      ) {
-        description += ` within ./`;
-      } else {
+      // Best effort relative path for display
+      try {
         const relativePath = makeRelative(
-          resolvedPath,
+          this.params.path,
           this.config.getTargetDir(),
         );
         description += ` within ${shortenPath(relativePath)}`;
+      } catch {
+        description += ` within ${this.params.path}`;
       }
     } else {
       // When no path is specified, indicate searching all workspace directories
@@ -425,24 +398,21 @@ export class RipGrepTool extends BaseDeclarativeTool<
     super(
       RipGrepTool.Name,
       'SearchText',
-      'Searches file contents for a pattern. Use this tool to find references, imports, or definitions to locate relevant files *before* reading them in their entirety. Returns matching lines with file paths and line numbers. Results are truncated if too large.',
+      'Searches file contents for a pattern. Use this tool to locate relevant files *before* reading them. Best Practice: Search directories to find all references; only search single files if you are certain of the location.',
       Kind.Search,
       {
         properties: {
           pattern: {
-            // Emphasize literal strings for precise reference finding.
             description:
               "The exact string or regular expression (regex) to search for. Prefer simple, literal strings for exact matches (e.g., 'export class User'). Use regex only when necessary for flexible matching.",
             type: 'string',
           },
           path: {
-            // Emphasize narrowing scope.
             description:
-              'Optional: The absolute path to a specific directory to narrow the search scope. Defaults to the current working directory.',
+              'Optional: The path to a specific file or directory to narrow the search scope. Can be absolute, relative to the workspace, or a unique filename. Defaults to the current working directory.',
             type: 'string',
           },
           include: {
-            // Emphasize precision.
             description:
               "Optional: A glob pattern to only search specific file types or patterns (e.g., '*.ts', 'src/controllers/**'). Use this to reduce noise in results.",
             type: 'string',
@@ -452,73 +422,6 @@ export class RipGrepTool extends BaseDeclarativeTool<
         type: 'object',
       },
     );
-  }
-
-  /**
-   * Checks if a path is within the root directory and resolves it.
-   * @param relativePath Path relative to the root directory (or undefined for root).
-   * @returns The absolute path if valid and exists, or null if no path specified (to search all directories).
-   * @throws {Error} If path is outside root, doesn't exist, or isn't a directory.
-   */
-  private resolveAndValidatePath(relativePath?: string): string | null {
-    // If no path specified, return null to indicate searching all workspace directories
-    if (!relativePath) {
-      return null;
-    }
-
-    const targetPath = path.resolve(this.config.getTargetDir(), relativePath);
-
-    // Security Check: Ensure the resolved path is within workspace boundaries
-    const workspaceContext = this.config.getWorkspaceContext();
-    if (!workspaceContext.isPathWithinWorkspace(targetPath)) {
-      const directories = workspaceContext.getDirectories();
-      throw new Error(
-        `Path validation failed: Attempted path "${relativePath}" resolves outside the allowed workspace directories: ${directories.join(', ')}`,
-      );
-    }
-
-    // Check existence and type after resolving
-    try {
-      const stats = fs.statSync(targetPath);
-      if (!stats.isDirectory()) {
-        throw new Error(`Path is not a directory: ${targetPath}`);
-      }
-    } catch (error: unknown) {
-      if (isNodeError(error) && error.code !== 'ENOENT') {
-        throw new Error(`Path does not exist: ${targetPath}`);
-      }
-      throw new Error(
-        `Failed to access path stats for ${targetPath}: ${error}`,
-      );
-    }
-
-    return targetPath;
-  }
-
-  /**
-   * Validates the parameters for the tool
-   * @param params Parameters to validate
-   * @returns An error message string if invalid, null otherwise
-   */
-  override validateToolParams(params: RipGrepToolParams): string | null {
-    const errors = SchemaValidator.validate(
-      this.schema.parametersJsonSchema,
-      params,
-    );
-    if (errors) {
-      return errors;
-    }
-
-    // Only validate path if one is provided
-    if (params.path) {
-      try {
-        this.resolveAndValidatePath(params.path);
-      } catch (error) {
-        return getErrorMessage(error);
-      }
-    }
-
-    return null; // Parameters are valid
   }
 
   protected createInvocation(
